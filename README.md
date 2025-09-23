@@ -28,6 +28,7 @@ It monitors top bug bounty platforms and alerts you when **new programs** appear
 git clone https://github.com/yourname/rinnegan.git
 cd rinnegan
 pip install -r requirements.txt
+```
 
 🚀 Usage
 
