@@ -9,7 +9,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
 
@@ -26,10 +26,10 @@ PLATFORM_FILES = {
 }
 DEFAULT_PLATFORMS = ["HackerOne", "Bugcrowd", "Intigriti", "YesWeHack", "Federacy"]
 
-TELEGRAM_TOKEN = "TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "CHAT_ID" # example: -1002891940184
-TELEGRAM_THREAD_ID = None # example: 115
-
+# NOTE: Keeping same tokens/IDs as in your original file (you can override via env vars)
+TELEGRAM_TOKEN = "TELEGRAM_TOKEN"
+TELEGRAM_CHAT_ID = "-TELEGRAM_CHAT_ID"
+TELEGRAM_THREAD_ID = None
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -566,15 +566,32 @@ def build_project_block(p: Dict[str, Any]) -> str:
     else:
         bounty = get_bounty(raw_data) or "—"
 
-    header = f"🎯 <b>{name}</b>"
+    # special header handling for scope-added change_type
+    change_type = p.get("change_type")
+    if change_type == "scope_added":
+        added_n = p.get("scope_added_count", 0)
+        header = f"🔁 <b>New Scope Added</b> — 🎯 <b>{name}</b>"
+    else:
+        header = f"🎯 <b>{name}</b>"
     if url:
-        header = f"🎯 <b><a href=\"{escape_html(url)}\">{name}</a></b>"
+        header = header.replace(f"<b>{name}</b>", f"<b><a href=\"{escape_html(url)}\">{name}</a></b>")
 
     lines = [header]
     lines.append(f"🔗 <b>Platform:</b> {platform}")
     lines.append(f"💰 <b>Bounty:</b> {escape_html(bounty) if bounty and bounty != '—' else '—'}")
     lines.append(f"🛡️ <b>VDP:</b> {pretty_bool_str(vdp_bool)}")
     lines.append(f"🔐 <b>RDP:</b> {pretty_bool_str(rdp_bool)}")
+
+    # if scope_added, show a line summarizing how many items were added
+    if change_type == "scope_added":
+        added_n = p.get("scope_added_count", 0)
+        added_preview = ""
+        items = p.get("scope_added_items") or []
+        if items:
+            # show up to 3 items as preview
+            preview_items = items[:3]
+            added_preview = " — " + ", ".join(escape_html(x) for x in preview_items) + (", …" if len(items) > 3 else "")
+        lines.append(f"🔁 <b>Change:</b> New scope items: {added_n}{added_preview}")
 
     # Scope summarization (same as before)
     scope_candidate = None
@@ -610,10 +627,15 @@ def build_platform_count_message(new_programs: List[Dict[str, Any]]) -> str:
     if not new_programs:
         return "No new programs detected."
 
-    plat_counts: Dict[str, int] = {}
+    # Count separately new programs vs scope additions
+    plat_new_counts: Dict[str, int] = {}
+    plat_scope_counts: Dict[str, int] = {}
     for p in new_programs:
         plat = p.get("platform") or p.get("provider") or "Unknown"
-        plat_counts[plat] = plat_counts.get(plat, 0) + 1
+        if p.get("change_type") == "scope_added":
+            plat_scope_counts[plat] = plat_scope_counts.get(plat, 0) + 1
+        else:
+            plat_new_counts[plat] = plat_new_counts.get(plat, 0) + 1
 
     emoji_map = {
         "HackerOne": "🕷",
@@ -624,10 +646,21 @@ def build_platform_count_message(new_programs: List[Dict[str, Any]]) -> str:
     }
 
     lines: List[str] = []
-    lines.append(f"⚡ <b>RINNEGAN — Platform counts</b> ⚡\n")
-    for plat, cnt in sorted(plat_counts.items(), key=lambda x: (-x[1], x[0])):
-        em = emoji_map.get(plat, "▫️")
-        lines.append(f"{em} <b>{escape_html(plat)}:</b> {cnt}")
+    # If there are new programs, show that header
+    if any(plat_new_counts.values()):
+        lines.append(f"⚡ <b>New Program Detected</b> ⚡\n")
+        for plat, cnt in sorted(plat_new_counts.items(), key=lambda x: (-x[1], x[0])):
+            em = emoji_map.get(plat, "▫️")
+            lines.append(f"{em} <b>{escape_html(plat)}:</b> {cnt}")
+        lines.append("")  # separation
+
+    # If there are scope additions, show separate header
+    if any(plat_scope_counts.values()):
+        lines.append(f"🔁 <b>New Scope Added</b> (existing programs updated)\n")
+        for plat, cnt in sorted(plat_scope_counts.items(), key=lambda x: (-x[1], x[0])):
+            em = emoji_map.get(plat, "▫️")
+            lines.append(f"{em} <b>{escape_html(plat)}:</b> {cnt}")
+
     return "\n".join(lines)
 
 
@@ -635,8 +668,8 @@ def build_telegram_messages(new_programs: List[Dict[str, Any]], per_message: int
     if not new_programs:
         return ["No new programs detected."]
 
-    header = f"⚡ <b>RINNEGAN</b> — <b>{len(new_programs)} New Programs</b> ⚡\n\n"
-    continuation_header = f"⚡ <b>RINNEGAN — CONTINUED</b> ⚡\n\n"
+    header = f""
+    continuation_header = f""
 
     blocks = [build_project_block(p) for p in new_programs]
 
@@ -900,6 +933,67 @@ def extract_program_summary(prog: Dict[str, Any]) -> Dict[str, Any]:
     return summary
 
 
+# -------------- New helpers to detect scope diffs ----------------
+
+def _get_scope_candidate_from_prog(prog: Dict[str, Any]) -> Any:
+    # same logic as used elsewhere to pick scope candidate
+    for key in ("scope", "targets", "in_scope", "inScope", "targets"):
+        if prog.get(key) is not None:
+            return prog.get(key)
+    if isinstance(prog.get("targets"), dict):
+        t = prog["targets"]
+        if isinstance(t.get("in_scope"), (list, tuple)):
+            return t.get("in_scope")
+        if isinstance(t.get("inScope"), (list, tuple)):
+            return t.get("inScope")
+        return prog.get("targets")
+    for k in ("targets", "scope", "in_scope", "structured_scopes"):
+        v = prog.get(k)
+        if isinstance(v, (list, tuple)):
+            return v
+        if isinstance(v, dict) and ("in_scope" in v):
+            return v.get("in_scope")
+    return None
+
+
+def _scope_items_set_from_candidate(scope_candidate: Any) -> Set[str]:
+    items: Set[str] = set()
+    if scope_candidate is None:
+        return items
+    if isinstance(scope_candidate, dict):
+        # try common keys
+        if "in_scope" in scope_candidate and isinstance(scope_candidate["in_scope"], (list, tuple)):
+            for it in scope_candidate["in_scope"]:
+                s = _extract_text_from_item(it)
+                if s:
+                    items.add(s.strip().lower())
+            return items
+        for k, v in scope_candidate.items():
+            if isinstance(v, (list, tuple)):
+                for it in v:
+                    s = _extract_text_from_item(it)
+                    if s:
+                        items.add(s.strip().lower())
+            else:
+                s = _extract_text_from_item(v)
+                if s:
+                    items.add(s.strip().lower())
+        return items
+    if isinstance(scope_candidate, (list, tuple)):
+        for it in scope_candidate:
+            s = _extract_text_from_item(it)
+            if s:
+                items.add(s.strip().lower())
+        return items
+    # fallback: single item
+    s = _extract_text_from_item(scope_candidate)
+    if s:
+        items.add(s.strip().lower())
+    return items
+
+
+# ---------------- detect new programs + scope changes ----------------
+
 def detect_new_programs(latest: List[Dict[str, Any]], prev_snapshot: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     latest_map: Dict[str, Dict[str, Any]] = {}
     for p in latest:
@@ -909,7 +1003,29 @@ def detect_new_programs(latest: List[Dict[str, Any]], prev_snapshot: Dict[str, A
     prev_map = prev_snapshot.get("programs", {}) if prev_snapshot else {}
 
     new_keys = set(latest_map.keys()) - set(prev_map.keys())
-    new_programs = [extract_program_summary(latest_map[k]) for k in sorted(new_keys)]
+    common_keys = set(latest_map.keys()) & set(prev_map.keys())
+
+    new_programs: List[Dict[str, Any]] = []
+    # first, add truly new programs (keys not previously present)
+    for k in sorted(new_keys):
+        new_programs.append(extract_program_summary(latest_map[k]))
+
+    # next, detect scope additions for programs that existed before but gained new scope items
+    for k in sorted(common_keys):
+        prev_prog = prev_map.get(k) or {}
+        latest_prog = latest_map.get(k) or {}
+        prev_scope_candidate = _get_scope_candidate_from_prog(prev_prog)
+        latest_scope_candidate = _get_scope_candidate_from_prog(latest_prog)
+        prev_set = _scope_items_set_from_candidate(prev_scope_candidate)
+        latest_set = _scope_items_set_from_candidate(latest_scope_candidate)
+        # if latest has at least one item that prev didn't -> consider scope_added
+        added_items = sorted(list(latest_set - prev_set))
+        if added_items:
+            summary = extract_program_summary(latest_prog)
+            summary["change_type"] = "scope_added"
+            summary["scope_added_count"] = len(added_items)
+            summary["scope_added_items"] = added_items
+            new_programs.append(summary)
 
     snapshot = {"fetched_at": int(time.time()), "programs": latest_map}
     return new_programs, snapshot
@@ -984,26 +1100,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Rinnegan — bounty watcher")
     parser.add_argument("--dry-run", action="store_true", help="Print messages instead of sending")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
-    parser.add_argument("--interval", type=int, default=SLEEP_INTERVAL, help="Seconds between runs")
     parser.add_argument("--just-hackerone", action="store_true", help="Only include HackerOne programs (debug)")
     args = parser.parse_args()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    interval = max(10, int(args.interval))
-    logger.info("Starting loop with interval %ds. Ctrl-C to stop.", interval)
-    try:
-        while True:
-            run_once(dry_run=args.dry_run, just_hackerone=args.just_hackerone)
-            logger.info("Sleeping %ds...", interval)
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user — exiting.")
-        return 0
-    except Exception:
-        logger.exception("Main loop crashed")
-        return 2
+    # ---- RUN ONCE AND EXIT ----
+    ok, discord_ok = run_once(dry_run=args.dry_run, just_hackerone=args.just_hackerone)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
