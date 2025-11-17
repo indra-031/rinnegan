@@ -24,7 +24,7 @@ It monitors top bug bounty platforms and alerts you when **new programs** appear
 
 ## ⚙️ Installation  
 
-```git clone https://github.com/yourname/rinnegan.git```
+```git clone https://github.com/indra-031/rinnegan.git```
 ```cd rinnegan```
 ```pip install -r requirements.txt```
 
